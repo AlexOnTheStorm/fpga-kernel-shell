@@ -1,0 +1,17 @@
+# Verible lint rules (tick_to_trade). Дополняй по вкусу.
+# Ключевые для нашего стандарта (docs/style_notes.md):
++case-missing-default
++enum-name-style
+# localparam/parameter в UPPER_SNAKE_CASE (наша конвенция), а не CamelCase:
++parameter-name-style=localparam_style:ALL_CAPS;parameter_style:ALL_CAPS
++explicit-parameter-storage-type
++packed-dimensions-range-ordering
++no-tabs
++no-trailing-spaces
++suggest-parentheses
++module-filename
++typedef-structs-unions
++always-comb
+# отключаем шумные/неактуальные:
+-line-length
+-explicit-function-lifetime
