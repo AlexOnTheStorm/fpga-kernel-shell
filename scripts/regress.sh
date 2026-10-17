@@ -12,7 +12,7 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE"
-[ -f /Users/alex/fpga-venv/bin/activate ] && source /Users/alex/fpga-venv/bin/activate
+FPGA_VENV="${FPGA_VENV:-$HOME/fpga-venv}"; [ -f "$FPGA_VENV/bin/activate" ] && source "$FPGA_VENV/bin/activate"
 
 export SIM_TIMEOUT="${SIM_TIMEOUT:-900}"
 export T9_SEEDS="${T9_SEEDS:-20}"

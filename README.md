@@ -160,7 +160,7 @@ Next step (not implemented): cut-through drain of the head burst, sending each b
 
 ## How to run
 
-Requirements: Verilator 5, a Python venv with `cocotb` 2, `numpy`, `pytest`, and Verible for lint. `scripts/run.sh` activates `~/fpga-venv` if it exists (edit the path for your setup) and wraps the run in a watchdog (`SIM_TIMEOUT`, default 600 s), because a failed SVA can leave the simulator hanging.
+Requirements: Verilator 5, a Python venv with `cocotb` 2, `numpy`, `pytest`, and Verible for lint. `scripts/run.sh` activates the venv at `$FPGA_VENV` (default `~/fpga-venv`) if it exists and wraps the run in a watchdog (`SIM_TIMEOUT`, default 600 s), because a failed SVA can leave the simulator hanging.
 
 ```bash
 cd scripts

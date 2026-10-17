@@ -17,7 +17,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE"
 
 # активируем venv c cocotb/verilator, если есть
-[ -f /Users/alex/fpga-venv/bin/activate ] && source /Users/alex/fpga-venv/bin/activate
+FPGA_VENV="${FPGA_VENV:-$HOME/fpga-venv}"; [ -f "$FPGA_VENV/bin/activate" ] && source "$FPGA_VENV/bin/activate"
 
 TOP="${1:?usage: run.sh <TOP> <MODULE> [SRCS]}"
 MODULE="${2:?usage: run.sh <TOP> <MODULE> [SRCS]}"
