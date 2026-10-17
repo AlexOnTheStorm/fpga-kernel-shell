@@ -40,6 +40,7 @@ module cmd_seq_sva
     input logic                   dec_err_v,
     input logic [     31:0]       cmd_no,
     input logic                   in_wait,
+    input logic                   seq_busy,
     input logic                   take
 );
   localparam int OFFW = $clog2(BURST_BYTES);
@@ -97,6 +98,19 @@ module cmd_seq_sva
   a_wr_legal :
   assert property (wr_v |-> wr_nb != '0 && wr_hbm[OFFW-1:0] == '0
                    && 33'(wr_spm) + 33'(wr_nb) * 33'(BURST) <= 33'(SPM_WORDS));
+
+  a_wr_end_in_mem :
+  assert property (wr_v |-> 41'(wr_hbm) + 41'(wr_nb) * 41'(BURST_BYTES) <= 41'(1) << AW);
+  a_rd_end_in_mem :
+  assert property (rd_v |-> 41'(rd_hbm) + 41'(rd_nb) * 41'(BURST_BYTES) <= 41'(1) << AW);
+
+  // busy: команда в cur_q (кроме error/halt, где она сброшена) видна kshell для IDLE
+  a_busy_when_disp :
+  assert property (any_v |-> seq_busy);
+  a_busy_when_wait :
+  assert property (in_wait |-> seq_busy);
+  a_busy_idle_is_empty :
+  assert property (!seq_busy |-> !any_v && !in_wait);
 
   // C. error / halt
   a_flush :

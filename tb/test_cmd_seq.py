@@ -132,7 +132,7 @@ class Env:
         g = lambda n: int(getattr(d, n).value)
         s = dict(cyc=self.cyc, en=en, error=self.error, rdy=rdy, head=head)
         for n in ("rd_v", "wr_v", "krn_v", "sig_v", "dec_err_v", "cq_pop", "cmd_no", "in_wait",
-                  "pf_wait", "rd_nb", "rd_no", "rd_hbm", "rd_spm", "rd_sem", "rd_stream"):
+                  "pf_wait", "seq_busy", "rd_nb", "rd_no", "rd_hbm", "rd_spm", "rd_sem", "rd_stream"):
             s[n] = g(n)
         self.trace.append(s)
         valids = s["rd_v"] + s["wr_v"] + s["krn_v"] + s["sig_v"]
@@ -661,3 +661,67 @@ async def test_random_against_reference(dut):
         assert env.evs() == expect, (rnd, env.evs(), expect)
         taken = min(len(cmds), (bad_at + 1) if expect and expect[-1][0] == "err" else len(cmds))
         assert env.trace[-1]["cmd_no"] == taken, (rnd, env.trace[-1]["cmd_no"], taken)
+
+
+@cocotb.test()
+async def test_seq_busy(dut):
+    """seq_busy = в секвенсоре есть взятая, не завершённая команда (для IDLE kshell, §12.1)."""
+    env = Env(dut, err_lat=None)
+    await env.start()
+    await env.run(3)
+    assert env.trace[-1]["seq_busy"] == 0  # пусто
+
+    # взятая команда видна на такте после взятия (выдача); дальше снова 0
+    env.cq = [pack(encode("LOAD", sem=1, spm=0, hbm=0, length=256))]
+    s0 = await env.step()
+    assert s0["cq_pop"] == 1 and s0["seq_busy"] == 0  # такт взятия: ещё в FIFO
+    s1 = await env.step()
+    assert s1["rd_v"] == 1 and s1["seq_busy"] == 1
+    s2 = await env.step()
+    assert s2["seq_busy"] == 0
+
+    # SIGNAL тоже занимает секвенсор на такт
+    env.cq = [pack(encode("SIGNAL", sem=1, w1=1))]
+    await env.step()
+    s = await env.step()
+    assert s["sig_v"] == 1 and s["seq_busy"] == 1
+    assert (await env.step())["seq_busy"] == 0
+
+    # команда, застрявшая на полной очереди, и пауза enable=0 с взятой командой
+    env.rdy["rd"] = 0.0
+    env.cq = [pack(encode("LOAD", sem=1, spm=0, hbm=0, length=256))]
+    await env.run(6)
+    assert all(t["seq_busy"] == 1 for t in env.trace[-4:])
+    env.enable = 0
+    env.rdy["rd"] = 1.0
+    await env.run(6)
+    assert all(t["seq_busy"] == 1 and t["rd_v"] == 0 for t in env.trace[-5:])
+    env.enable = 1
+    await env.run(3)
+    assert env.trace[-1]["seq_busy"] == 0 and len(env.events) == 3
+
+    # WAIT в работе: занят весь период ожидания (и на паузе), свободен после прохода
+    env.cq = [pack(encode("WAIT", sem=2, w1=1))]
+    await env.run(6)
+    assert all(t["seq_busy"] == 1 and t["in_wait"] == 1 for t in env.trace[-4:])
+    env.enable = 0
+    env.sem[2] = 1
+    await env.run(4)
+    assert all(t["seq_busy"] == 1 for t in env.trace[-3:])
+    env.enable = 1
+    await env.run(3)
+    assert env.trace[-1]["seq_busy"] == 0
+
+    # error: удержанная команда и WAIT сброшены, busy сразу 0 и остаётся 0 при выкачке FIFO
+    env.sem[2] = 0
+    env.cq = [pack(encode("WAIT", sem=2, w1=5))] + [pack(encode("SIGNAL", sem=1, w1=1))] * 5
+    await env.run(5)
+    assert env.trace[-1]["seq_busy"] == 1
+    env.error = 1
+    for _ in range(8):
+        s = await env.step()
+        assert s["seq_busy"] == 0
+    assert not env.cq
+    await env.soft_reset()
+    await env.run(2)
+    assert env.trace[-1]["seq_busy"] == 0

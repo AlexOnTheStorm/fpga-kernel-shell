@@ -84,7 +84,10 @@ module cmd_seq
     output logic [31:0] dec_err_cmd,
     output logic [31:0] cmd_no,
     output logic        in_wait,
-    output logic        pf_wait
+    output logic        pf_wait,
+    // в секвенсоре есть взятая, но не завершённая команда (cur_q: ждёт очередь/WAIT/enable);
+    // kshell включает !seq_busy в IDLE (§12.1)
+    output logic        seq_busy
 );
 
   // Дескриптор §6. CMD1 = hbm_lo / thr / inc / arg0; CMD2 целиком = arg1 (hbm_hi = [7:0]);
@@ -280,6 +283,7 @@ module cmd_seq
 
   // WAIT «в работе»: ждёт условие (на error прерван — сразу низкий)
   assign in_wait      = (state_q == S_WAIT) && !err_eff;
+  assign seq_busy     = (state_q != S_IDLE) && !err_eff;
   assign pf_wait      = in_wait && !wait_pass;
 
 endmodule
