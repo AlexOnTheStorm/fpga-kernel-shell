@@ -24,13 +24,19 @@ RESULTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "result
 BURST = 8                       # beat'ов в burst'е (kshell_pkg::BURST)
 BEATS = 1024                    # = SPM_WORDS: 32 KB (ruling R6)
 SWEEP_HDR = "ntag,lat,beats,cycles,bw,bw_ss,model"
-OVL_HDR = "name,CYCLES,KRN_BUSY,RD_BURSTS,RD_LAT_SUM,STRM_BP,SEQ_WAIT,RD_WIN_FULL"
+OVL_LAT, OVL_PSTALL = (40, 160), 0.2     # как T4; p_stall задан явно
+OVL_HDR = "name,CYCLES,KRN_BUSY,RD_BURSTS,RD_LAT_SUM,STRM_BP,SEQ_WAIT,RD_WIN_FULL,lat_lo,lat_hi,p_stall"
 
 
 def model_bw(ntag, lat):
     """Закон Литтла (§3): в полёте NTAG×BURST beat'ов, время жизни burst'а ≈ L + BURST тактов
     (AR → последний beat), потолок — 1 beat за такт."""
     return min(1.0, ntag * BURST / (lat + BURST))
+
+
+def fitted_bw(ntag, lat):
+    """Эмпирическая подгонка: слот занят ≈ L + 2·BURST (на ≈ BURST дольше, чем в §3). Не из спецификации."""
+    return min(1.0, ntag * BURST / (lat + 2 * BURST))
 
 
 def _append(path, hdr, row):
@@ -103,18 +109,35 @@ async def demo_sweep(dut):
         await shell.soft_reset(ax); await ax.write(shell.REG["CTRL"], 1)
 
     # --- качественные утверждения (§3)
+    # Три проверки на каждую точку:
+    #  1) потолок Литтла: bw_ss не выше модели из §3 (nothing beats the window) — модель = верхняя граница;
+    #  2) подогнанная модель FIT = min(1, NTAG·BURST/(L + 2·BURST)) — ЭМПИРИЧЕСКАЯ (смещение
+    #     ≈ BURST подобрано по данным, механизм трассой не проверен), допуск 3 %: ловит регрессию
+    #     на 10 %, которую широкий допуск к модели §3 пропустил бы;
+    #  3) насыщение: где FIT = 1 (окно закрывает задержку), bw_ss ≥ 0.97; где L ≪ NTAG×BURST, bw ≥ 0.9.
+    n_bound = n_sat = 0
     for lat, (bw, bw_ss, mdl) in res.items():
-        assert abs(bw_ss - mdl) <= 0.10 * mdl + 0.02, f"NTAG={ntag} L={lat}: ss={bw_ss:.3f} модель={mdl:.3f}"
-        if 2 * (lat + BURST) <= ntag * BURST:           # L ≪ NTAG×BURST: окно закрывает задержку
-            assert bw_ss >= 0.95 and bw >= 0.9, f"NTAG={ntag} L={lat}: bw={bw:.3f} ss={bw_ss:.3f}"
-    beyond = [l for l in sorted(res) if model_bw(ntag, l) < 1.0]      # за «коленом»
+        fit = fitted_bw(ntag, lat)
+        assert bw_ss <= mdl + 0.01, f"NTAG={ntag} L={lat}: ss={bw_ss:.3f} выше потолка Литтла {mdl:.3f}"
+        assert abs(bw_ss - fit) <= 0.03 * fit + 0.005, \
+            f"NTAG={ntag} L={lat}: ss={bw_ss:.3f} подогнанная модель={fit:.3f}"
+        if fit < 1.0:
+            n_bound += 1                                 # окно ограничивает полосу: проверена граница
+        else:
+            n_sat += 1
+            assert bw_ss >= 0.97, f"NTAG={ntag} L={lat}: нет насыщения ss={bw_ss:.3f}"
+        if 2 * (lat + BURST) <= ntag * BURST:
+            assert bw >= 0.9, f"NTAG={ntag} L={lat}: bw={bw:.3f}"
+    assert n_bound + n_sat == len(res) and n_bound >= 1, \
+        f"NTAG={ntag}: нет ни одной точки за «коленом» (n_bound={n_bound}) — свип ничего не проверил"
+    beyond = [l for l in sorted(res) if fitted_bw(ntag, l) < 1.0]     # за «коленом»
     for a, b in zip(beyond, beyond[1:]):
         assert res[b][1] < res[a][1], f"NTAG={ntag}: полоса не убывает {a}→{b}: {res[a][1]:.3f} {res[b][1]:.3f}"
 
 
 @cocotb.test(skip=TOP != "kshell_top")
 async def demo_overlap(dut):
-    ax, mem = await bringup(dut, lat=(40, 160), seed=4)
+    ax, mem = await bringup(dut, lat=OVL_LAT, seed=4, p_stall=OVL_PSTALL)
     rng = np.random.default_rng(4); M, K = 64, 512
     W, x0, y0 = gemv_case(rng, M, K); _, x1, _ = gemv_case(rng, M, K)
     y1 = (W.astype(np.int64) @ x1.astype(np.int64)).astype(np.int32)
@@ -135,7 +158,8 @@ async def demo_overlap(dut):
         os.remove(csv)
     for name, r in res.items():
         _append(csv, OVL_HDR, f"{name},{r['CYCLES']},{r['KRN_BUSY']},{r['RD_BURSTS']},"
-                f"{r['RD_LAT_SUM']},{r['STRM_BP']},{r['SEQ_WAIT']},{r['RD_WIN_FULL']}")
+                f"{r['RD_LAT_SUM']},{r['STRM_BP']},{r['SEQ_WAIT']},{r['RD_WIN_FULL']},"
+                f"{OVL_LAT[0]},{OVL_LAT[1]},{OVL_PSTALL}")
     s, o = res["sequential"], res["overlapped"]
     assert o["CYCLES"] < s["CYCLES"], (s, o)
     assert o["KRN_BUSY"] / o["CYCLES"] > s["KRN_BUSY"] / s["CYCLES"], (s, o)
