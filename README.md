@@ -5,7 +5,7 @@ The kernel gets a **narrow contract**: an AXI4-Stream in, a scratchpad port, `st
 The shell owns everything else: AXI4 to HBM, outstanding transactions, out-of-order read responses restored to in-order, semaphore-based synchronization between engines, errors, safe pause/reset, and performance counters.
 A new kernel is a black box that is checked against an executable contract (`kshell_kif_sva`), not a block that re-implements memory plumbing.
 
-**Status: simulation only** (Verilator + cocotb, Python AXI memory model). No synthesis, no timing closure, no silicon. All numbers below are simulation clock counts. See [Limitations](#limitations).
+**Status: simulation only** (Verilator + cocotb, Python AXI memory model). No synthesis, no timing closure, no silicon. All numbers below are simulation clock counts. See [Limitations and next steps](#limitations-and-next-steps).
 
 Spec (Russian): [`docs/design.md`](docs/design.md). RTL style: [`docs/style_notes.md`](docs/style_notes.md).
 
@@ -44,7 +44,7 @@ Spec (Russian): [`docs/design.md`](docs/design.md). RTL style: [`docs/style_note
 | `cmd_seq` | decode and check commands, dispatch to engine queues in order, WAIT, stop on error |
 | `rd_dma` | LOAD and STREAM: burst slicing, AR with `ARID` = window slot, in-order commit, ROB |
 | `wr_dma` | STORE: scratchpad to W-FIFO first, then AW/W, count B responses |
-| `spm` | 2-port scratchpad (A: DMA, B: kernel), byte write strobes |
+| `spm` | true dual-port scratchpad written as the vendor BRAM template (one address and one `always_ff` per port): A = DMA, full-word writes; B = kernel, byte write strobes |
 | `sem_file` | semaphore counters, same-cycle increments are summed |
 | `kshell_perf` | 8 perf counters with an atomic snapshot |
 | `kshell_kif_sva` | the kernel contract as bindable assertions |
@@ -60,7 +60,7 @@ Defaults: `DW=256`, `AW=40`, `NTAG=16` outstanding read bursts, `BURST=8` beats 
 | Stream | `k_s_tdata/tvalid/tready/tlast` (AXI4-Stream, shell to kernel) | one RUN consumes exactly one STREAM command, in order; `tlast` on the last beat; `tready = 0` outside `k_start..k_done` |
 | Scratchpad | `k_spm_en/we/addr/wdata/wstrb`, `k_spm_rdata` | port B belongs to the kernel only; read data one cycle after the request |
 
-The kernel does not see semaphores, AXI IDs, or addresses in memory; argument meaning is the kernel's business. These rules are checked by `kshell_kif_sva`, bound onto any kernel.
+The kernel does not see semaphores, AXI IDs, or addresses in memory; argument meaning is the kernel's business. `kshell_kif_sva`, bound onto any kernel, checks the safety part of these rules: at most one `k_done` per `k_start` (and only for a started RUN); `k_done` only after the RUN's `tlast` was accepted (or after `k_err`); `tready` only inside the RUN window and not after `tlast`; no port-B access in a reset cycle. Liveness (that `k_done` eventually comes) is not an assertion; test timeouts catch it.
 
 ## Programming model
 
@@ -77,7 +77,9 @@ The host writes four 32-bit words `CMD0..CMD3` (one 128-bit descriptor) and ring
 
 Decode checks: `len` and `hbm` multiples of 256 B (`ALIGN`), scratchpad range (`RANGE`), opcode (`BAD_OPCODE`). The first error aborts: the sequencer stops, queues are flushed, in-flight AXI transactions are *completed* (none is abandoned), and the host does `SOFT_RESET` once `AXI_QUIET=1`.
 
-Program correctness rules (no head-of-line deadlock, STREAM/RUN pairing, WAIT between conflicting commands) are checked statically by `tb/isa.py: check_program`; every test program goes through it.
+Program correctness rules (no head-of-line deadlock, STREAM/RUN pairing, WAIT between conflicting commands) are checked statically by `tb/isa.py: check_program`. All test programs go through it except the deliberate negative tests (decode errors, the watchdog tests that issue a RUN before its STREAM on purpose, error-priority and kernel-error programs).
+
+`CTRL` is written as a whole register, not bit-set/clear: `ENABLE` takes bit 0 of every write. So `CTRL = 0x2` (`SOFT_RESET`) or `0x4` (`PERF_SNAP`) also clears `ENABLE`; write `ENABLE | SOFT_RESET` (`0x3`) or `ENABLE | PERF_SNAP` (`0x5`) to keep running.
 
 ### Example: two GEMV tasks with overlap
 
@@ -121,11 +123,9 @@ The head-of-line cost of the shared window is real and deliberate: a stalled STR
 Toolchain: Verilator 5 (`--assert`, and `--coverage` in separate builds) and cocotb 2. Lint is Verilator `-Wall` plus Verible.
 
 - **Python models** (`tb/`): an AXI4 slave memory model with 8 pseudo-channels, random per-channel latency (so responses are **out of order by ID**), random `ARREADY/AWREADY/WREADY` stalls, optional beat interleaving between IDs, `SLVERR` injection, a "stop responding" mode, and protocol checks (`WLAST`, `AxLEN`, 4 KB boundary). An AXI4-Lite driver. A program builder and a **static program checker**. A NumPy GEMV reference.
-- **System tests T1 to T9**: memcpy through the scratchpad; STREAM into a sink kernel (OoO order, `tlast`, skid at `tready=0`); GEMV against NumPy; the overlap program against its sequential baseline; `SLVERR` injected into LOAD, STREAM and STORE with the kernel mid-RUN (error code, `ERR_CMD`, WAIT aborted, semaphores frozen, `AXI_QUIET`, `SOFT_RESET`, next program correct); pause and resume mid-program; decode errors and command-FIFO overflow; watchdog on a dead memory (and no false trigger on pause or a long WAIT); **random LOAD/STORE/SIGNAL/WAIT programs compared against a sequential Python reference** (memory, scratchpad and semaphores, 20 seeds). Plus module tests for the primitives, `rd_dma`, `wr_dma`, `cmd_seq`, `gemv_kernel`, and 37 pytest cases for the program builder, checker, generator and memory model.
-- **SVA** in bind files: AXI master protocol (valid/payload stability, `AxLEN`, 4 KB, W-beat count), the rd window (R only for in-flight slots, `RLAST` consistency, `tail-head <= NTAG`), AXIS stability, scratchpad port conflicts (only when a side writes; A-read vs B-read is legal), `SOFT_RESET` only at `AXI_QUIET`, and **`kshell_kif_sva`, the executable kernel contract**, bound onto both `gemv_kernel` and the test sink kernel.
-- **Functional coverage**: 30 bins, **30/30 hit** (union over the two system tops, `kshell_sink_top` and `kshell_top`): window full, OoO distance bins (0, 1-3, 4-7, 8+), beat interleaving, head-of-line blocking, all opcodes, WAIT stall and WAIT aborted by error, all seven error codes, pause under traffic, W-FIFO full, simultaneous increments on one semaphore. Two directed tests exist only to close bins that random traffic did not reach (`hol`, same-semaphore collisions). Also checked by hand-applied mutations (for example, committing a LOAD before its last beat makes the random-program test fail).
-
-Honest caveat: RRESP/BRESP error bins are hit only on `kshell_top`, so per-top coverage is 28/30 and 17/30; closure is on the union.
+- **System tests T1 to T9**: memcpy through the scratchpad; STREAM into a sink kernel (OoO order, `tlast`, skid at `tready=0`); GEMV against NumPy; the overlap program against its sequential baseline; `SLVERR` injected into LOAD, STREAM and STORE with the kernel mid-RUN (error code, `ERR_CMD`, WAIT aborted, semaphores frozen, `AXI_QUIET`, `SOFT_RESET`, next program correct), plus `SLVERR` on a LOAD and on a STORE as the first error on the sink-kernel top; pause and resume mid-program; decode errors and command-FIFO overflow; watchdog on a dead memory (and no false trigger on pause or a long WAIT); **random LOAD/STORE/SIGNAL/WAIT programs compared against a sequential Python reference** (memory, scratchpad and semaphores, 20 seeds). Plus module tests for the primitives (including the scratchpad's BRAM-template read-hold and byte strobes), `rd_dma`, `wr_dma`, `cmd_seq`, `gemv_kernel`, and 37 pytest cases for the program builder, checker, generator and memory model.
+- **SVA** in bind files: AXI master protocol (valid/payload stability, `AxLEN`, W-beat count; the 4 KB rule follows from 256 B-aligned bursts, which the decoder enforces, and the memory model checks it on every AR/AW), the rd window (R only for in-flight slots, `RLAST` consistency, `tail-head <= NTAG`), AXIS stability, scratchpad port conflicts (only when a side writes; A-read vs B-read is legal), `SOFT_RESET` only at `AXI_QUIET`, and **`kshell_kif_sva`, the executable kernel contract** (the four checks listed under [Kernel contract](#kernel-contract)), bound onto both `gemv_kernel` and the test sink kernel. A mutated sink kernel that raises `k_done` one beat before `tlast` used to pass every SVA (the program even completed, and only the end-to-end data compare noticed); the `k_done`-after-`tlast` assertion now fires at that `k_done`.
+- **Functional coverage**: 30 bins: window full, OoO distance bins (0, 1-3, 4-7, 8+), beat interleaving, head-of-line blocking, all opcodes, WAIT stall and WAIT aborted by error, all seven error codes, pause under traffic, W-FIFO full, simultaneous increments on one semaphore. **`kshell_sink_top` alone hits 30/30**; `kshell_top` (GEMV) hits 17/30, since the decode-error, interleaving, `hol` and same-semaphore bins are driven by sink-top tests; the union is 30/30. Three directed tests exist only to close bins that random traffic did not reach (`hol`, same-semaphore collisions, and `SLVERR` as the first error on the sink top). Code coverage, sink top / GEMV top / union: line 91.1 / 90.6 / 94.2 %, branch 97.4 / 93.9 / 95.9 %. Also checked by hand-applied mutations (for example, committing a LOAD before its last beat makes the random-program test fail).
 
 ## Results
 
@@ -152,9 +152,11 @@ One 32 KB STREAM (1024 beats) into a sink kernel that is always ready; memory la
 | 8 (64 beats) | 1.000 | 0.970 | 0.552 | 0.386 | 0.296 | 0.203 |
 | 16 (128 beats) | 1.000 | 1.000 | 1.000 | 0.771 | 0.593 | 0.405 |
 
-This is Little's law: the window holds `NTAG x BURST` beats, so it hides memory latency until `L` is about `NTAG x BURST`, and beyond that bandwidth falls roughly as `NTAG x BURST / L`. The knee is visible per row: NTAG=16 stays at 1.0 up to L=100 and drops at L=150.
+This is Little's law: the window holds `NTAG x BURST` beats, so bandwidth is `NTAG x BURST / (slot hold time)`, capped at 1 beat per cycle. The knee is visible per row: NTAG=16 stays at 1.0 up to L=100 and drops at L=150.
 
-The naive bound `NTAG x BURST / (L + BURST)` is a ceiling that the measurement never exceeds (tests assert that). The measurement sits a little below it. What fits all 18 points within about 1 % is the **empirical** curve `min(1, NTAG x BURST / (L + 2 x BURST))`, i.e. a slot is held about one extra burst. My explanation (a slot is released only after its beats have gone out to the stream, because of in-order commit) is an inference from the fit and **has not been verified with a trace**.
+The slot hold time follows from the RTL (spec section 8.5). A STREAM head becomes ready only after its `RLAST` (`h_ready = w_done_q[hslot]` in `rtl/rd_dma.sv`), and the slot retires only when the last of its BURST beats has left the ROB for the stream (`rd_end`). With the first beat `L` cycles after AR: AR to `RLAST` is `L + BURST - 1`, plus 1 cycle to set `done`, plus `BURST` cycles to drain. So the head advances `L + 2 x BURST` cycles after its AR, which gives `min(1, NTAG x BURST / (L + 2 x BURST))` with the knee at `L + 2 x BURST <= NTAG x BURST`. The measurement matches this derived curve at all 18 points (largest deviation 0.03 %; the test allows 3 %). The naive bound `NTAG x BURST / (L + BURST)`, which assumes the slot frees at `RLAST`, is a ceiling that the measurement never exceeds (also asserted).
+
+Next step (not implemented): cut-through drain of the head burst, sending each beat to the stream as soon as it lands in the ROB instead of waiting for `RLAST`. That would cut the slot hold time to about `L + BURST`, i.e. up to the naive bound.
 
 ## How to run
 
@@ -167,30 +169,37 @@ make lint                                   # Verible + Verilator -Wall on the d
 # Python-only tests: program builder, static checker, random-program generator, memory model
 ~/fpga-venv/bin/python -m pytest ../tb/test_isa.py ../tb/test_hbm_model.py -q
 
-# Module test (run.sh <TOP> <test module> "<sources>")
+# Everything: lint, pytest, all module tests, both system tops with all SVA binds
+# (T9 with 20 seeds). Exact per-step commands are in the script; logs go to regress_<step>.log
+./regress.sh
+./regress.sh cov          # + coverage builds of both tops and a per-top / union covergroup summary
+
+# One module test by hand (run.sh <TOP> <test module> "<sources>")
 ./run.sh rd_dma test_rd_dma "../rtl/kshell_pkg.sv ../rtl/fifo_sync.sv ../rtl/rd_dma.sv"
 
-# System test T1-T9 on kshell_top (GEMV), all SVA binds, short watchdog
+# One system top by hand: kshell_top (GEMV), all SVA binds, short watchdog
 COMMON="../rtl/kshell_pkg.sv ../rtl/fifo_sync.sv ../rtl/sem_file.sv ../rtl/spm.sv ../rtl/rd_dma.sv ../rtl/wr_dma.sv ../rtl/cmd_seq.sv ../rtl/axil_regs.sv ../rtl/kshell_perf.sv ../rtl/kshell.sv"
-SVA_EXTRA="../rtl/rd_dma_sva.sv ../rtl/wr_dma_sva.sv ../rtl/cmd_seq_sva.sv ../rtl/kshell_sva.sv ../rtl/kshell_kif_sva.sv ../rtl/gemv_kernel_sva.sv" \
-  EXTRA_ARGS="-GWDOG_CYCLES=2000" SIM_TIMEOUT=900 \
+SVA="../rtl/rd_dma_sva.sv ../rtl/wr_dma_sva.sv ../rtl/cmd_seq_sva.sv ../rtl/kshell_sva.sv ../rtl/kshell_kif_sva.sv"
+SVA_EXTRA="$SVA ../rtl/gemv_kernel_sva.sv" EXTRA_ARGS="-GWDOG_CYCLES=2000" SIM_TIMEOUT=900 \
   ./run.sh kshell_top test_system "$COMMON ../rtl/gemv_kernel.sv ../rtl/kshell_top.sv"
 
-# Same on the sink-kernel top, with 20 random-program seeds (use ../tb/sink_kernel_sva.sv instead of gemv_kernel_sva.sv)
-T9_SEEDS=20 SVA_EXTRA="... ../tb/sink_kernel_sva.sv" EXTRA_ARGS="-GWDOG_CYCLES=2000" \
+# The sink-kernel top, with 20 random-program seeds
+T9_SEEDS=20 SVA_EXTRA="$SVA ../tb/sink_kernel_sva.sv" EXTRA_ARGS="-GWDOG_CYCLES=2000" SIM_TIMEOUT=900 \
   ./run.sh kshell_sink_top test_system "$COMMON ../tb/sink_kernel.sv ../tb/kshell_sink_top.sv"
 
-# Demo: NTAG x latency sweep + overlap comparison, writes ../results/ (about a minute)
+# Demo: NTAG x latency sweep + overlap comparison, writes ../results/ (a few minutes)
 ./demo.sh
 
-# Functional + code coverage (separate build from the assertion runs)
+# Functional + code coverage of one top (separate build from the assertion runs)
 COV_EXTRA="../rtl/rd_dma_cov.sv ../rtl/cmd_seq_cov.sv ../rtl/kshell_cov.sv" EXTRA_ARGS="-GWDOG_CYCLES=2000" \
   make cov TOP=kshell_top MODULE=test_system SRCS="$COMMON ../rtl/gemv_kernel.sv ../rtl/kshell_top.sv"
 ```
 
+Note: cocotb runs a test that matches `COCOTB_TEST_FILTER` even when the test is marked `skip` for the other top, so filter only by tests that belong to the top you build.
+
 Assertion runs and coverage runs are separate builds because Verilator 5.x hits an internal error with `--assert` and `--coverage` together.
 
-## Limitations
+## Limitations and next steps
 
 Deliberately out of scope: synthesis and timing closure, clock-domain crossing (single clock), multiple kernels, interconnect, credit-based links, interrupts (the host polls), kernel-side access by computed addresses, overlap *inside* a kernel (the kernel does not see semaphores), and reset with unfinished AXI transactions (a real system needs a decoupler for that).
 
@@ -200,12 +209,18 @@ Also worth saying plainly:
 - The program correctness rules (section 6.1 of the spec) are the host's responsibility; the checker catches violations in tests but hardware does not enforce them. A broken program deadlocks, and the watchdog only covers a silent memory.
 - The overlap speedup is one seed on one workload.
 
+Known timing weak spots (found in review; the RTL is deliberately left as is, the project is simulation-only). These are the first things to fix before timing closure:
+- **AXI R feeds the scratchpad combinationally.** `rvalid`/`rid` drive the spm write address (a 16:1 mux by slot plus an adder) and the port-A grant to `wr_dma` in the same cycle. Next step: one register stage on R inside `rd_dma`. Since `RREADY = 1`, no skid buffer is needed; the cost is 1 cycle of latency.
+- **`soft_rst` / `k_rst_n` are combinational** (the AXI-Lite write pulse AND `AXI_QUIET`). Next step: register `soft_rst` and hold `go` low for the pending cycle; latch a request made while not quiet instead of ignoring it.
+- **Kernel-to-shell signals** (`k_done`, `k_err`, `k_s_tready`) enter shell logic unregistered, so the path length depends on the kernel. Next step: require flop-driven kernel outputs in the contract (spec section 5), or register them at the boundary (a skid buffer for `tready`).
+- **STREAM slot hold** is `L + 2 x BURST` (see Results). Next step: cut-through drain of the head burst.
+
 ## Layout
 
 ```
 rtl/        shell modules, gemv_kernel, kshell_top, *_sva.sv and *_cov.sv bind files
 tb/         cocotb tests, hbm_model.py, axil.py, isa.py (builder + static checker), test kernel
-scripts/    Makefile, run.sh (build + run one test), demo.sh, demo_report.py
+scripts/    Makefile, run.sh (build + run one test), regress.sh (full regression), demo.sh, demo_report.py
 results/    demo.md, sweep.csv, overlap.csv
 docs/       design.md (specification, Russian), style_notes.md
 ```

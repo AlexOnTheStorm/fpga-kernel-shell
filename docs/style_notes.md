@@ -47,8 +47,9 @@
 
 ## 4. Ассершены
 - **Отдельный файл `rtl/<module>_sva.sv`, `bind <module> … (.*)`** — рядом с RTL, не в tb/,
-  не inline. Дизайн и проверки разделены, но колокированы. Синтез `*_sva.sv` не читает
-  (в `synth.tcl` только дизайн-файлы).
+  не inline. Дизайн и проверки разделены, но колокированы. Синтез `*_sva.sv` не читает:
+  список дизайн-файлов — как `RTL_DESIGN` в `scripts/Makefile` (без `*_sva.sv`/`*_cov.sv`);
+  синтез-скрипта в этом репозитории нет (только симуляция).
 
 ## 5. Именование / ширины / числа
 - lowRISC: `lower_snake_case`, один модуль на файл, суффиксы `_q`/`_d` для рег/next.
@@ -69,7 +70,7 @@ make fmt             # verible-verilog-format (авто-форматирован
 
 ## 8. Coverage (code + functional)
 Нетривиальный модуль сопровождается **покрытием** — это часть верификации, а не
-опция. Детали и тулчейн-ловушки — `docs/coverage.md`.
+опция. Тулчейн-ловушки — ниже в этом разделе.
 - **Code coverage** — Verilator `--coverage` (line/toggle/branch/expr). Прогон:
   `make cov TOP=<mod> MODULE=test_<mod>` → аннотация в `annot/`, строки `%00` — дыры.
 - **Functional coverage** — SV `covergroup` в **отдельном bind-файле `rtl/<mod>_cov.sv`**
