@@ -574,8 +574,9 @@ module kshell
   assign k_rst_n   = rst_n && !soft_rst;
   assign k_start   = kq_v && !krn_busy_q && go;
   assign k_arg     = kq_arg;
-  // k_done засчитывается только у запущенного RUN и без ошибки (§7, §11)
-  assign k_done_ok = k_done && krn_busy_q && !err_now;
+  // k_done засчитывается только у запущенного RUN и без ошибки (§7, §11); k_err того же
+  // такта ещё не дошёл до err_now (регистр k_err_q) — гасим и по сырому k_err
+  assign k_done_ok = k_done && krn_busy_q && !err_now && !k_err;
 
   always_ff @(posedge clk) begin
     if (!rst_n || soft_rst) krn_busy_q <= 1'b0;

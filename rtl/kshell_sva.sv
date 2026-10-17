@@ -6,9 +6,11 @@
 //    B. Ошибка: липкая до soft_rst; первая (код и номер) не перезаписывается;
 //       код ≠ NONE при ERROR; abort держится вместе с ошибкой (контракт wr_dma);
 //       приоритет одновременных ошибок §12.2 (TIMEOUT > RRESP > BRESP > KERNEL > dec).
-//    C. Семафоры: при ошибке приращений от rd/wr/ядра нет (§11).
+//    C. Семафоры: при ошибке приращений от rd/wr/ядра нет (§11); k_done в такте
+//       сырого k_err (до регистра k_err_q) семафор RUN не увеличивает.
 //    D. spm: порт A — один источник за такт (запись rd_dma ИЛИ чтение wr_dma);
-//       порты A и B не обращаются к одному адресу в одном такте (§10).
+//       запись одного порта не совпадает по адресу с доступом другого (§10);
+//       чтение A и чтение B одного адреса — законно.
 //    E. Ядро: k_start только при свободном ядре и без ошибки/паузы; krn_busy
 //       снимается только k_done/soft_rst.
 //    F. Предикаты: IDLE ⇒ AXI_QUIET и всё пусто; watchdog не считает в тишине.
@@ -45,9 +47,11 @@ module kshell_sva
     input logic             wr_spm_rd_gnt,
     input logic [SPMAW-1:0] wr_spm_rd_addr,
     input logic             k_spm_en,
+    input logic             k_spm_we,
     input logic [SPMAW-1:0] k_spm_addr,
     input logic             k_start,
     input logic             k_done,
+    input logic             k_err,
     input logic             krn_busy_q,
     input logic             cq_empty,
     input logic             rq_empty,
@@ -96,6 +100,9 @@ module kshell_sva
   // C. семафоры не растут от движков/ядра при ошибке
   a_no_inc_on_err :
   assert property ((error_q || err_any) |-> !inc_rd_v && !inc_wr_v && !k_done_ok);
+  // k_done вместе с k_err ядра: приращения от ядра (inc_k_v = k_done_ok) нет в этом же такте
+  a_no_kinc_on_raw_kerr :
+  assert property (k_done && k_err |-> !k_done_ok);
   // под ошибкой (включая такт её импульса) семафор меняет только хост: SIGNAL секвенсор
   // тоже не выдаёт — независимая от гейтинга проверка R10
   a_sem_frozen_on_err :
@@ -107,7 +114,7 @@ module kshell_sva
   a_spm_ab_wr_collide :
   assert property (!(rd_spm_wr_v && k_spm_en && rd_spm_wr_addr == k_spm_addr));
   a_spm_ab_rd_collide :
-  assert property (!(wr_spm_rd_gnt && k_spm_en && wr_spm_rd_addr == k_spm_addr));
+  assert property (!(wr_spm_rd_gnt && k_spm_en && k_spm_we && wr_spm_rd_addr == k_spm_addr));
 
   // E. ядро
   a_kstart_free :
