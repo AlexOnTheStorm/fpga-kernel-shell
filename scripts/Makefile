@@ -20,9 +20,16 @@ SVA := $(wildcard $(CURDIR)/../rtl/$(TOP)_sva.sv)
 COV := $(wildcard $(CURDIR)/../rtl/$(TOP)_cov.sv)
 # дополнительные bind-файлы для --assert (например ../rtl/kshell_kif_sva.sv)
 SVA_EXTRA ?=
+# дополнительные bind-файлы для --coverage (системные топы: ../rtl/rd_dma_cov.sv …)
+COV_EXTRA ?=
 
 VERILOG_SOURCES += $(SRCS)
 TOPLEVEL = $(TOP)
+
+# EXTRA_ARGS из окружения (например -GWDOG_CYCLES=2000) — до наших `+=`: make экспортирует
+# переменную окружения дальше уже ДОПОЛНЕННОЙ, и `make cov` (здесь VCOV=0 → --assert)
+# передал бы --assert в VCOV=1-сборку → Internal Error Verilator. cov передаёт исходное.
+EXTRA_ARGS_USER := $(EXTRA_ARGS)
 
 # где cocotb ищет test-модуль (tb/)
 export PYTHONPATH := $(CURDIR)/../tb:$(PYTHONPATH)
@@ -37,8 +44,11 @@ EXTRA_ARGS += -Werror-UNOPTFLAT         # комбинаторная петля 
 # NB: имя НЕ COVERAGE — оно занято cocotb (=COCOTB_USER_COVERAGE, Python-покрытие).
 VCOV ?= 0
 ifeq ($(VCOV),1)
-VERILOG_SOURCES += $(COV)
-EXTRA_ARGS += --coverage
+VERILOG_SOURCES += $(COV) $(COV_EXTRA)
+# line-покрытие вставляет счётчики в always_comb FSM ядер (k_s_tready и state_d в одном
+# блоке) → Verilator не делит блок и видит ЛОЖНУЮ петлю tready→hs→блок. Реальные петли
+# ловит обычный (--assert) прогон с -Werror-UNOPTFLAT; здесь — только предупреждение.
+EXTRA_ARGS += --coverage -Wno-UNOPTFLAT
 else
 VERILOG_SOURCES += $(SVA) $(SVA_EXTRA)
 EXTRA_ARGS += --assert
@@ -78,6 +88,6 @@ fmt:
 # строки с '%00' в annot/ — непокрытые точки. См. docs/coverage.md.
 cov:
 	@$(MAKE) --no-print-directory clean
-	@$(MAKE) --no-print-directory VCOV=1 TOP=$(TOP) MODULE=$(MODULE)
+	@EXTRA_ARGS='$(EXTRA_ARGS_USER)' $(MAKE) --no-print-directory VCOV=1 TOP=$(TOP) MODULE=$(MODULE)
 	@verilator_coverage --annotate $(CURDIR)/annot --annotate-min 1 coverage.dat
 	@echo "покрытие аннотировано → annot/ (ищи '%00' — непокрытое)"

@@ -332,3 +332,149 @@ def check_program(prog, ntag=16, run_regions="gemv", eq_depth=EQ_DEPTH):
     stream_of_run, run_of_stream = _pair_stream_run(cmds)
     _execute(cmds, run_of_stream, ntag, eq_depth)
     _check_data(cmds, stream_of_run, run_regions)
+
+
+# --------------------------------------------------------------------------- T9 (§16)
+
+N_WORK_SEM = 7          # семафоры 0..6 — работа; sem7 — «программа прошла» для хоста
+
+
+def _rw_regions(op, spm, hbm, length):
+    """Области LOAD/STORE: {space: (reads, writes)}, space 'spm' — слова, 'mem' — байты."""
+    s = (spm, spm + length // BB)
+    m = (hbm, hbm + length)
+    if op == "LOAD":
+        return dict(spm=((), (s,)), mem=((m,), ()))
+    return dict(spm=((s,), ()), mem=((), (m,)))
+
+
+def _conflict(a, b):
+    """RAW / WAR / WAW между областями a (раньше) и b (позже) хоть в одном пространстве."""
+    for space in ("spm", "mem"):
+        (ar, aw), (br, bw) = a[space], b[space]
+        if _overlap(list(aw), list(br) + list(bw)) or _overlap(list(ar), list(bw)):
+            return True
+    return False
+
+
+def random_program(rng, n_cmds, spm_words=SPM_WORDS, hbm_base=0, hbm_size=1 << 16,
+                   max_bursts=8):
+    """Случайная программа T9 (§16): n_cmds случайных команд LOAD/STORE/SIGNAL/WAIT плюс
+    вставленные барьеры, в конце — общий барьер и SIGNAL sem7, 1. Правила генератора:
+    - WAIT sem ≥ N только при N ≤ уже выданных приращений на sem (никогда не тупик);
+    - области spm и памяти каждой LOAD/STORE отслеживаются; перед командой, пересекающейся
+      (RAW/WAR/WAW) с ещё не гарантированно завершённой командой A, вставляется барьер
+      WAIT sem(A) ≥ всего выданного на sem(A) — он гарантирует ВСЕ команды этого семафора;
+    - STORE читает только слова spm, уже записанные LOAD'ами этой программы (содержимое
+      spm до программы не определено — эталон не может его знать);
+    - длины кратны BURST_BYTES (1..max_bursts burst'ов), hbm выровнен по burst'у и лежит
+      в [hbm_base, hbm_base + hbm_size), spm — в [0, spm_words).
+    Число рабочих семафоров на программу случайно (1, 2, 4 или 7): мало семафоров — чаще
+    одновременные приращения одного семафора и длиннее барьеры."""
+    p = Program()
+    emitted = [0] * NSEM
+    pending = []                     # (sem, области) команд, завершение которых не гарантировано
+    defined = [False] * spm_words    # слова spm, записанные LOAD'ами программы
+    nsem = rng.choice((1, 2, 4, N_WORK_SEM))
+    blocks = hbm_size // BURST_BYTES
+
+    def barrier(s):
+        nonlocal pending
+        p.wait(s, emitted[s])
+        pending = [x for x in pending if x[0] != s]
+
+    def dma(op, sem, spm, hbm, length):
+        reg = _rw_regions(op, spm, hbm, length)
+        while True:                  # барьер снимает все команды семафора — повторить поиск
+            hit = next((s for s, r in pending if _conflict(r, reg)), None)
+            if hit is None:
+                break
+            barrier(hit)
+        getattr(p, op.lower())(sem, spm, hbm, length)
+        emitted[sem] += 1
+        pending.append((sem, reg))
+        if op == "LOAD":
+            for w in range(spm, spm + length // BB):
+                defined[w] = True
+
+    def store_starts(words):
+        run, out = 0, []
+        for w in range(spm_words):
+            run = run + 1 if defined[w] else 0
+            if run >= words:
+                out.append(w - words + 1)
+        return out
+
+    for _ in range(n_cmds):
+        sem = rng.randrange(nsem)
+        op = rng.choices(("LOAD", "STORE", "SIGNAL", "WAIT"), (35, 35, 12, 18))[0]
+        nb = rng.randint(1, max_bursts)
+        length, words = nb * BURST_BYTES, nb * BURST_BYTES // BB
+        hbm = hbm_base + BURST_BYTES * rng.randrange(blocks - nb + 1)
+        if op == "STORE":
+            starts = store_starts(words)
+            if not starts:
+                op = "LOAD"          # нечего выгружать — сначала загрузить
+            else:
+                dma("STORE", sem, rng.choice(starts), hbm, length)
+                continue
+        if op == "LOAD":
+            dma("LOAD", sem, rng.randrange(spm_words - words + 1), hbm, length)
+        elif op == "SIGNAL":
+            inc = rng.randint(1, 3)
+            p.signal(sem, inc)
+            emitted[sem] += inc
+        else:
+            n = rng.randint(0, emitted[sem])
+            if n == emitted[sem] and n > 0:
+                barrier(sem)
+            else:
+                p.wait(sem, n)
+    for s in range(N_WORK_SEM):      # общий барьер
+        if emitted[s]:
+            p.wait(s, emitted[s])
+    p.signal(7, 1)
+    return p
+
+
+def execute_reference(prog, init, base, spm_words=SPM_WORDS, with_spm=False):
+    """Эталон T9: последовательное исполнение LOAD/STORE/SIGNAL/WAIT над копией памяти
+    [base, base + len(init)) и spm из spm_words слов по BB байт. При правилах генератора
+    (барьер перед каждой пересекающейся командой) параллельное исполнение железом даёт тот
+    же результат. Возвращает (bytes памяти, list значений NSEM семафоров); with_spm=True —
+    третьим элементом список слов spm (bytes или None — слово программой не записано).
+    WAIT проверяется: его порог обязан быть достижим к моменту WAIT (иначе ValueError)."""
+    mem = bytearray(init)
+    spm = [None] * spm_words
+    sem = [0] * NSEM
+
+    def span(hbm, length):
+        lo = hbm - base
+        if lo < 0 or lo + length > len(mem):
+            raise ValueError(f"hbm={hbm:#x}+{length} вне эталонной памяти")
+        return lo, lo + length
+
+    for i, c in enumerate(prog.cmds):
+        op = c["op"]
+        if op == "LOAD":
+            lo, hi = span(c["hbm"], c["len"])
+            for k in range(c["len"] // BB):
+                spm[c["spm"] + k] = bytes(mem[lo + BB * k: lo + BB * (k + 1)])
+            sem[c["sem"]] += 1
+        elif op == "STORE":
+            lo, hi = span(c["hbm"], c["len"])
+            for k in range(c["len"] // BB):
+                w = spm[c["spm"] + k]
+                if w is None:
+                    raise ValueError(f"#{i} STORE читает незаписанное слово spm {c['spm'] + k}")
+                mem[lo + BB * k: lo + BB * (k + 1)] = w
+            sem[c["sem"]] += 1
+        elif op == "SIGNAL":
+            sem[c["sem"]] += c["inc"]
+        elif op == "WAIT":
+            if _signed32(sem[c["sem"]] - c["thr"]) < 0:
+                raise ValueError(f"#{i} WAIT sem{c['sem']} ≥ {c['thr']} недостижим ({sem[c['sem']]})")
+        else:
+            raise ValueError(f"#{i} {op}: эталон T9 знает только LOAD/STORE/SIGNAL/WAIT")
+    sem = [v & _M32 for v in sem]
+    return (bytes(mem), sem, spm) if with_spm else (bytes(mem), sem)

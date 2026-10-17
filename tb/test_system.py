@@ -2,7 +2,8 @@
 # (OoO по ID). Тест выбирается по имени верхнего уровня (kshell_sink_top / kshell_top).
 #   T1 memcpy LOAD → WAIT → STORE; T2 STREAM в sink_kernel (порядок при OoO, tlast, skid);
 #   T7 ошибки декодирования + переполнение командной FIFO;
-#   T3 GEMV, T4 перекрытие; T5 SLVERR в полёте, T6 пауза/продолжение, T8 watchdog (kshell_top).
+#   T3 GEMV, T4 перекрытие; T5 SLVERR в полёте, T6 пауза/продолжение, T8 watchdog (kshell_top);
+#   T9 случайные программы LOAD/STORE/SIGNAL/WAIT против Python-эталона (kshell_sink_top).
 # Дополнительно к брифу (Task 6): IDLE/perf/SOFT_RESET после программы, порядок AW/W в
 # AXI-Lite, KERNEL_ERR от sink_kernel, watchdog, приоритет ошибок в одном такте нет (§12.2
 # покрыт kshell_sva). Сборка: -GWDOG_CYCLES=2000 (R5), все module SVA через SVA_EXTRA (R4).
@@ -15,7 +16,7 @@ from cocotb.triggers import ReadOnly, RisingEdge
 
 from axil import AxilMaster
 from hbm_model import HbmModel
-from isa import Program, check_program
+from isa import Program, check_program, random_program, execute_reference
 import shell
 
 TOP = os.environ.get("COCOTB_TOPLEVEL") or os.environ.get("TOPLEVEL")
@@ -561,3 +562,138 @@ async def t_kdone_after_error(dut):
     await shell.soft_reset(ax)
     st = await shell.status(ax)
     assert st["IDLE"] and not st["ERROR"], st
+
+
+# --------------------------------------------------------------------------- T9 (бриф, часть 4)
+
+def spm_words(dut, words):
+    """Слова spm (bytes, little-endian по байтам beat'а) прямым чтением массива памяти."""
+    arr = dut.u_shell.u_spm.mem_q
+    return {w: int(arr[w].value).to_bytes(32, "little") for w in words}
+
+
+@cocotb.test(skip=TOP != "kshell_sink_top")
+async def t9_random_programs(dut):
+    """§16: случайные программы против последовательного эталона. Сверх брифа: каждая
+    программа проверяется до конца (IDLE, нет ERROR), сравнивается и spm (слова, записанные
+    программой), sem7; OoO/чередование модели памяти реально были."""
+    seeds = int(os.environ.get("T9_SEEDS", 20))
+    ooo = inter = 0
+    for seed in range(seeds):
+        ax, mem = await bringup(dut, lat=(5, 120), seed=seed, interleave=bool(seed % 2))
+        rng = random.Random(seed)
+        init = bytes(rng.randrange(256) for _ in range(1 << 16))
+        mem.write_bytes(0x500000, init)
+        p = random_program(rng, n_cmds=40, spm_words=1024, hbm_base=0x500000, hbm_size=1 << 16)
+        check_program(p, run_regions=None)
+        ref_mem, ref_sem, ref_spm = execute_reference(p, init, base=0x500000, with_spm=True)
+        await shell.submit(ax, p); await shell.wait_sem(ax, 7, 1)
+        got_mem = mem.read_bytes(0x500000, 1 << 16)
+        if got_mem != ref_mem:
+            off = next(i for i in range(len(ref_mem)) if got_mem[i] != ref_mem[i])
+            raise AssertionError(f"seed {seed}: память расходится с эталоном с 0x{0x500000 + off:x} "
+                                 f"(burst {off // 256}, программа {len(p)} команд)")
+        for i in range(7): assert await ax.read(shell.REG["SEM"] + 4 * i) == ref_sem[i], (seed, i)
+        st = await settle(dut, ax)
+        assert not st["ERROR"] and st["cq_free"] == 16, (seed, st)
+        assert await ax.read(shell.REG["SEM"] + 4 * 7) == 1, seed
+        want = {w: v for w, v in enumerate(ref_spm) if v is not None}
+        got = spm_words(dut, want)
+        bad = [w for w in want if got[w] != want[w]]
+        assert not bad, f"seed {seed}: spm слова {bad[:8]}"
+        assert await ax.read(shell.REG["CMD_COUNT"]) == len(p), seed
+        ooo += mem.stats["ooo"]; inter += mem.stats["interleaved"]
+        dut._log.info("T9 seed %d: %d команд, %s", seed, len(p), mem.stats)
+        mem.stop(); await shell.reset(dut)
+    assert ooo > 0 and (seeds < 2 or inter > 0), (ooo, inter)
+
+
+# --------------------------------------------------------------------------- closure покрытия (§16)
+
+@cocotb.test(skip=TOP != "kshell_sink_top")
+async def t_hol_blocking(dut):
+    """§8.5 head-of-line (сознательно): голова STREAM стоит, пока ядро не берёт поток, и
+    готовый LOAD за ней не коммитится — его данные уже в spm, слот done, но sem не растёт.
+    После снятия backpressure поток и LOAD завершаются по порядку, данные верны.
+    Closure бина rd_dma_cov.cp_hol."""
+    ax, mem = await bringup(dut, lat=(5, 20), seed=31)
+    rng = random.Random(31)
+    src_s = bytes(rng.randrange(256) for _ in range(256))
+    src_l = bytes(rng.randrange(256) for _ in range(256))
+    mem.write_bytes(0x600000, src_s); mem.write_bytes(0x610000, src_l)
+    dut.k_stall.value = 1                                   # ядро не берёт поток
+    p = Program()
+    p.stream(0x600000, 256)                                 # #0 1 burst: голова окна
+    p.load(0, 100, 0x610000, 256)                           # #1 следующий слот
+    p.run(1, 0, 8, 0, 0)                                    # #2 sink: spm[0..8) ← поток
+    p.wait(0, 1); p.wait(1, 1)                              # правило 2: RUN уже выдан
+    p.store(2, 0, 0x620000, 256); p.store(2, 100, 0x630000, 256); p.wait(2, 2); p.signal(7, 1)
+    check_program(p, run_regions=lambda a: ([], [(a[0], a[0] + a[1])]))
+    await shell.submit(ax, p)
+    for _ in range(300): await RisingEdge(dut.clk)
+    u = dut.u_shell.u_rd
+    st = await shell.status(ax)
+    assert st["rd_inflight"] == 2 and st["krn_busy"], st              # STREAM + LOAD в окне
+    assert int(dut.k_s_tvalid.value) and not int(dut.k_s_tready.value)
+    hs, done = int(u.head_q.value) % 16, int(u.w_done_q.value)
+    assert all(done >> ((hs + k) % 16) & 1 for k in range(2)), f"{done:#x}"   # оба слота done
+    assert int(u.w_stream_q[hs].value) == 1 and int(u.w_stream_q[(hs + 1) % 16].value) == 0
+    assert await sem(ax, 0) == 0                                      # LOAD готов, но не снят
+    got = spm_words(dut, range(100, 108))
+    assert b"".join(got[w] for w in range(100, 108)) == src_l         # данные LOAD уже в spm
+    dut.k_stall.value = 0
+    await shell.wait_sem(ax, 7, 1)
+    assert mem.read_bytes(0x620000, 256) == src_s and mem.read_bytes(0x630000, 256) == src_l
+    pf = await shell.perf(ax)
+    assert pf["STRM_BP"] > 250, pf
+
+
+@cocotb.test(skip=TOP != "kshell_sink_top")
+async def t_sem_collide(dut):
+    """§11: приращения одного семафора в одном такте суммируются. Командная FIFO
+    заполняется на паузе (ENABLE = 0): STORE s, LOAD v, LOAD s (nb burst'ов), WAIT v ≥ 1,
+    12 × SIGNAL s. После ENABLE = 1 WAIT пропускает поезд SIGNAL'ов (по одному за такт)
+    примерно тогда, когда коммитится LOAD s и приходит B STORE s. Сиды перебираются, пока
+    монитор не увидит пары rd+SIGNAL, wr+SIGNAL, rd+wr и тройку rd+wr+SIGNAL в одном такте на
+    один семафор (сиды фиксированы → детерминировано); каждый раз SEM[s] сверяется с суммой. Closure бинов kshell_cov.cp_same_inc / cp_pair_*."""
+    ax, mem = await bringup(dut, lat=(2, 10), seed=41)
+    u = dut.u_shell
+    seen = dict(rd_sig=0, wr_sig=0, rd_wr=0, three=0)
+
+    async def mon():
+        while True:
+            await ReadOnly()
+            src = []
+            if int(u.inc_rd_v.value): src.append(("rd", int(u.rd_sem_inc_idx.value)))
+            if int(u.inc_wr_v.value): src.append(("wr", int(u.wr_sem_inc_idx.value)))
+            if int(u.sig_v.value): src.append(("sig", int(u.sig_idx.value)))
+            for a, b in (("rd", "sig"), ("wr", "sig"), ("rd", "wr")):
+                if {i for n, i in src if n == a} & {i for n, i in src if n == b}:
+                    seen[f"{a}_{b}"] += 1
+            if len(src) == 3 and len({s for _, s in src}) == 1:
+                seen["three"] += 1
+            await RisingEdge(dut.clk)
+    task = cocotb.start_soon(mon())
+    it = 0
+    for it in range(400):
+        rng = random.Random(1000 + it)
+        s, v = rng.sample(range(7), 2)
+        p = Program()
+        p.store(s, 0, 0x700000, 256)
+        p.load(v, 100, 0x710000, 256)
+        p.load(s, 200, 0x720000, 256 * rng.randint(1, 3))
+        p.wait(v, 1)
+        for _ in range(12): p.signal(s, 1)
+        check_program(p, run_regions=None)
+        await ax.write(shell.REG["CTRL"], 0)                # пауза: FIFO копит программу
+        await shell.submit(ax, p)
+        await ax.write(shell.REG["CTRL"], 1)
+        await shell.wait_sem(ax, s, 14, timeout=5000)
+        await settle(dut, ax)
+        assert await sem(ax, s) == 14 and await sem(ax, v) == 1, (it, s, v)
+        await shell.soft_reset(ax)
+        if all(seen.values()):
+            break
+    task.cancel()
+    dut._log.info("t_sem_collide: %d итераций, совпадения %s", it + 1, seen)
+    assert all(seen.values()), seen

@@ -177,3 +177,96 @@ def test_overlapped_and_sequential_gemv_ok():
         p.wait(2, 2); p.signal(7, 1)
         check_program(p)
         check_program(demo_program(M, K))
+
+
+# --------------------------------------------------------------------------- T9: генератор и эталон
+
+import random                                                    # noqa: E402
+from isa import random_program, execute_reference                # noqa: E402
+
+
+def test_random_program_passes_checker():
+    for seed in range(300):
+        rng = random.Random(seed)
+        p = random_program(rng, n_cmds=40, spm_words=1024, hbm_base=0x500000, hbm_size=1 << 16)
+        check_program(p, run_regions=None)
+        ops = {c["op"] for c in p.cmds}
+        assert ops <= {"LOAD", "STORE", "SIGNAL", "WAIT"}, ops
+        assert p.cmds[-1]["op"] == "SIGNAL" and p.cmds[-1]["sem"] == 7 and p.cmds[-1]["inc"] == 1
+        assert all(c["sem"] < 7 for c in p.cmds[:-1])
+        for c in p.cmds:
+            if c["op"] in ("LOAD", "STORE"):
+                assert c["len"] % 256 == 0 and c["hbm"] % 256 == 0
+                assert 0x500000 <= c["hbm"] and c["hbm"] + c["len"] <= 0x500000 + (1 << 16)
+                assert c["spm"] + c["len"] // 32 <= 1024
+
+
+def test_random_program_wait_reachable_and_barriers():
+    """WAIT sem ≥ N только при N ≤ уже выданных приращений; хвост — общий барьер."""
+    for seed in range(100):
+        p = random_program(random.Random(seed), n_cmds=40, hbm_base=0, hbm_size=1 << 16)
+        for i, c in enumerate(p.cmds):
+            if c["op"] == "WAIT":
+                before = Program(); before.cmds = p.cmds[:i]
+                assert c["thr"] <= before.increments(c["sem"]), (seed, i)
+        tail = [c for c in p.cmds[:-1][::-1]]
+        totals = {s: p.increments(s) for s in range(7) if p.increments(s)}
+        barrier = {c["sem"]: c["thr"] for c in tail[:len(totals)]}
+        assert all(c["op"] == "WAIT" for c in tail[:len(totals)]) and barrier == totals, seed
+
+
+def test_random_program_variety():
+    """Генератор реально даёт пересечения (вставленные барьеры), все 4 кода и STORE."""
+    seen, barriers = set(), 0
+    for seed in range(50):
+        p = random_program(random.Random(seed), n_cmds=40, hbm_base=0, hbm_size=1 << 16)
+        seen |= {c["op"] for c in p.cmds}
+        barriers += sum(1 for c in p.cmds if c["op"] == "WAIT" and c["thr"] == p.increments(c["sem"]))
+    assert seen == {"LOAD", "STORE", "SIGNAL", "WAIT"} and barriers > 50
+
+
+def test_reference_hand_written():
+    base = 0x1000
+    init = bytes(range(256)) * 16                                # 4 KB
+    p = Program()
+    p.load(0, 10, base + 0x100, 512)                             # spm[10..26) ← mem[0x100..0x300)
+    p.signal(2, 3)
+    p.wait(0, 1)
+    p.store(1, 18, base + 0x800, 256)                            # mem[0x800..0x900) ← spm[18..26)
+    p.wait(1, 1)
+    p.load(0, 0, base + 0x800, 256)                              # spm[0..8) ← mem[0x800..)
+    p.wait(0, 2)
+    p.store(1, 0, base + 0x000, 256)                             # mem[0..0x100) ← spm[0..8)
+    p.wait(1, 2); p.signal(7, 1)
+    mem, sem, spm = execute_reference(p, init, base, with_spm=True)
+    exp = bytearray(init)
+    exp[0x800:0x900] = init[0x200:0x300]
+    exp[0x000:0x100] = init[0x200:0x300]
+    assert mem == bytes(exp)
+    assert sem == [2, 2, 3, 0, 0, 0, 0, 1]
+    assert spm[10] == init[0x100:0x120] and spm[0] == init[0x200:0x220] and spm[8] is None
+    assert execute_reference(p, init, base)[0] == mem             # без spm — 2 элемента
+
+
+def test_reference_rejects_bad_programs():
+    init = bytes(4096)
+    p = Program(); p.store(0, 0, 0, 256)                         # spm не записан
+    with pytest.raises(ValueError, match="незаписанное"):
+        execute_reference(p, init, 0)
+    p = Program(); p.wait(0, 1)                                  # порог недостижим
+    with pytest.raises(ValueError, match="недостижим"):
+        execute_reference(p, init, 0)
+    p = Program(); p.load(0, 0, 0x2000, 256)                     # вне памяти
+    with pytest.raises(ValueError, match="вне"):
+        execute_reference(p, init, 0)
+
+
+def test_reference_matches_random_programs():
+    """Эталон исполняет каждую сгенерированную программу без ошибок; sem = выданные."""
+    for seed in range(50):
+        rng = random.Random(seed)
+        init = bytes(rng.randrange(256) for _ in range(1 << 16))
+        p = random_program(rng, n_cmds=40, hbm_base=0x500000, hbm_size=1 << 16)
+        mem, sem = execute_reference(p, init, 0x500000)
+        assert len(mem) == len(init)
+        assert sem == [p.increments(s) for s in range(8)]
