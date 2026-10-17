@@ -6,3 +6,6 @@ coverage.dat
 annot/
 __pycache__/
 .superpowers/
+regress_*.log
+*.dat
+annot_merged/

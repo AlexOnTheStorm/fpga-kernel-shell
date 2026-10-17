@@ -9,7 +9,7 @@
 //            0 / 1–3 / 4–7 / 8+.
 //    cg_beat (на R-beat'е): чередование — beat продолжает burst после beat'а
 //            другого ID.
-//  Подмножество covergroup у Verilator (docs/coverage.md tick_to_trade): синхронный снимок `_r`
+//  Подмножество covergroup у Verilator (docs/style_notes.md §8): синхронный снимок `_r`
 //  против дельта-гонки bound-covergroup, явный sample(), условие внешним if.
 // =====================================================================
 /* verilator lint_off SYMRSVDWORD */

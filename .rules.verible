@@ -1,4 +1,4 @@
-# Verible lint rules (tick_to_trade). Дополняй по вкусу.
+# Verible lint rules (kshell). Дополняй по вкусу.
 # Ключевые для нашего стандарта (docs/style_notes.md):
 +case-missing-default
 +enum-name-style

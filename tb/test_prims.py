@@ -100,3 +100,53 @@ async def test_spm_port_a_priority(dut):
     dut.a_rd_req.value = 0
     await ReadOnly()
     assert int(dut.a_rd_data.value) == 0xABC
+
+
+@cocotb.test(skip=top_name() != "spm")
+async def test_spm_tdp_template(dut):
+    """BRAM-шаблон (NO_CHANGE): a_rd_data держится через запись порта A; маска байтов порта B."""
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    dut.b_en.value = 0
+    dut.b_we.value = 0
+    dut.a_rd_req.value = 0
+    dut.a_wr_v.value = 0
+
+    async def a_write(addr, data):
+        dut.a_wr_v.value = 1
+        dut.a_wr_addr.value = addr
+        dut.a_wr_data.value = data
+        await RisingEdge(dut.clk)
+        dut.a_wr_v.value = 0
+
+    await a_write(7, 0x1111)
+    await a_write(8, 0x2222)
+    # чтение A по адресу 7; в следующем такте порт A пишет адрес 8 (как rd_dma после gnt wr_dma)
+    dut.a_rd_req.value = 1
+    dut.a_rd_addr.value = 7
+    await ReadOnly()
+    assert int(dut.a_rd_gnt.value) == 1
+    await RisingEdge(dut.clk)
+    dut.a_rd_req.value = 0
+    dut.a_wr_v.value = 1
+    dut.a_wr_addr.value = 8
+    dut.a_wr_data.value = 0x3333
+    await ReadOnly()
+    assert int(dut.a_rd_data.value) == 0x1111          # такт после gnt — данные готовы
+    await RisingEdge(dut.clk)
+    dut.a_wr_v.value = 0
+    await ReadOnly()
+    assert int(dut.a_rd_data.value) == 0x1111          # запись порта A не портит регистр чтения
+    await RisingEdge(dut.clk)
+
+    # порт B: запись только байтов 0 и 2 поверх 0x3333 в адресе 8, затем чтение
+    dut.b_en.value = 1
+    dut.b_we.value = 1
+    dut.b_addr.value = 8
+    dut.b_wdata.value = 0xAABBCCDD
+    dut.b_wstrb.value = 0b101
+    await RisingEdge(dut.clk)
+    dut.b_we.value = 0
+    await RisingEdge(dut.clk)
+    dut.b_en.value = 0
+    await ReadOnly()
+    assert int(dut.b_rdata.value) == 0x00BB33DD

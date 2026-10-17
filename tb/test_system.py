@@ -3,7 +3,8 @@
 #   T1 memcpy LOAD → WAIT → STORE; T2 STREAM в sink_kernel (порядок при OoO, tlast, skid);
 #   T7 ошибки декодирования + переполнение командной FIFO;
 #   T3 GEMV, T4 перекрытие; T5 SLVERR в полёте, T6 пауза/продолжение, T8 watchdog (kshell_top);
-#   T9 случайные программы LOAD/STORE/SIGNAL/WAIT против Python-эталона (kshell_sink_top).
+#   T9 случайные программы LOAD/STORE/SIGNAL/WAIT против Python-эталона (kshell_sink_top);
+#   t_slverr_sink — SLVERR первой ошибкой на LOAD и STORE (kshell_sink_top, бины RRESP/BRESP).
 # Дополнительно к брифу (Task 6): IDLE/perf/SOFT_RESET после программы, порядок AW/W в
 # AXI-Lite, KERNEL_ERR от sink_kernel, watchdog, приоритет ошибок в одном такте нет (§12.2
 # покрыт kshell_sva). Сборка: -GWDOG_CYCLES=2000 (R5), все module SVA через SVA_EXTRA (R4).
@@ -118,6 +119,8 @@ async def t2_stream_order(dut):
     mem.write_bytes(0x300000, src)
     p = Program(); p.stream(0x300000, len(src)); p.run(0, 0, len(src) // 32, 0, 0)
     p.wait(0, 1); p.store(1, 0, 0x400000, len(src)); p.wait(1, 1); p.signal(7, 1)
+    # sink_kernel пишет поток в spm[a0, a0 + a1) (a1 = число beat'ов)
+    check_program(p, run_regions=lambda a: ([], [(a[0], a[0] + a[1])]))
     await shell.submit(ax, p); await shell.wait_sem(ax, 7, 1)
     assert mem.read_bytes(0x400000, len(src)) == src
     stall.stop()
@@ -216,9 +219,44 @@ async def t_kernel_err(dut):
     await ax.write(shell.REG["CTRL"], 1)
     p = Program(); p.stream(0x300000, len(src)); p.run(0, 0, 16, 0, 0); p.wait(0, 1)
     p.store(1, 0, 0x400000, len(src)); p.wait(1, 1); p.signal(7, 1)
-    check_program(p, run_regions=None)
+    check_program(p, run_regions=lambda a: ([], [(a[0], a[0] + a[1])]))
     await shell.submit(ax, p); await shell.wait_sem(ax, 7, 1)
     assert mem.read_bytes(0x400000, len(src)) == src
+
+
+@cocotb.test(skip=TOP != "kshell_sink_top")
+async def t_slverr_sink(dut):
+    """SLVERR как первая ошибка на sink-топе: RRESP на LOAD (#0) и BRESP на STORE (#2).
+    Код и номер команды, семафор сбойной команды не растёт, выданное доводится до AXI_QUIET,
+    SOFT_RESET, затем та же программа без SLVERR проходит (замыкает бины err.rresp/bresp)."""
+    src = bytes(random.Random(24).randrange(256) for _ in range(256 * 4))
+    cases = (("load", 0x500000 + 256 * 2, 1, 0, (0, 0)),
+             ("store", 0x600000 + 256 * 1, 2, 2, (1, 0)))
+    for target, bad, code, cmd, exp_sem in cases:
+        ax, mem = await bringup(dut, lat=(10, 80), seed=24, interleave=True, slverr={bad})
+        mem.write_bytes(0x500000, src)
+        p = Program(); p.load(0, 0, 0x500000, len(src)); p.wait(0, 1)
+        p.store(1, 0, 0x600000, len(src)); p.wait(1, 1); p.signal(7, 1)
+        check_program(p, run_regions=None)
+        await shell.submit(ax, p)
+        for _ in range(5000):
+            await RisingEdge(dut.clk)
+            if (st := await shell.status(ax))["ERROR"]: break
+        assert st["ERROR"], f"{target}: нет ERROR"
+        assert await ax.read(shell.REG["ERR_CODE"]) == code, target
+        assert await ax.read(shell.REG["ERR_CMD"]) == cmd, target
+        for _ in range(2000 // 16):
+            if (st := await shell.status(ax))["AXI_QUIET"]: break
+            for _ in range(16): await RisingEdge(dut.clk)
+        assert st["AXI_QUIET"] and st["cq_free"] == 16, (target, st)
+        assert (await sem(ax, 0), await sem(ax, 1), await sem(ax, 7)) == exp_sem + (0,), target
+        await shell.soft_reset(ax)
+        st = await shell.status(ax)
+        assert st["IDLE"] and not st["ERROR"] and await ax.read(shell.REG["ERR_CODE"]) == 0, st
+        mem.slverr.clear(); await ax.write(shell.REG["CTRL"], 1)
+        await shell.submit(ax, p); await shell.wait_sem(ax, 7, 1)
+        assert mem.read_bytes(0x600000, len(src)) == src, target
+        mem.stop(); await shell.reset(dut)
 
 
 @cocotb.test(skip=TOP != "kshell_sink_top")

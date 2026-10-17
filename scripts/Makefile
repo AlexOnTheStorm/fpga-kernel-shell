@@ -85,7 +85,7 @@ fmt:
 
 # code + functional coverage: прогон под --coverage → аннотация исходников.
 # verilator_coverage печатает сводку (line/toggle/branch/expr/covergroup);
-# строки с '%00' в annot/ — непокрытые точки. См. docs/coverage.md.
+# строки с '%00' в annot/ — непокрытые точки. Ловушки тулчейна — docs/style_notes.md §8.
 cov:
 	@$(MAKE) --no-print-directory clean
 	@EXTRA_ARGS='$(EXTRA_ARGS_USER)' $(MAKE) --no-print-directory VCOV=1 TOP=$(TOP) MODULE=$(MODULE)
