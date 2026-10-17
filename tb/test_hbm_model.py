@@ -270,3 +270,18 @@ def test_freeze():
         assert not int(d.arready.value) and not int(d.awready.value) and not int(d.wready.value)
         assert not int(d.rvalid.value)
     assert not rm.done
+
+
+def test_hold_release():
+    """hold: ответ burst'а задержан до release(); остальные ID идут мимо него."""
+    d = FakeDut()
+    m = HbmModel(d, lat=(5, 5), seed=1, p_stall=0.0, hold={0x100}, slverr={0x100})
+    rm = ReadMaster(d, [0x100, 0x200, 0x300])
+    for _ in range(200):
+        step(m, [rm])
+    assert [a for a, _ in rm.done] == [0x200, 0x300] and not rm.finished()
+    m.release(0x100)
+    step(m, [rm])                              # такт release: beat уже на R
+    assert int(d.rvalid.value) and int(d.rresp.value) == 2
+    run(m, [rm], rm.finished)
+    assert rm.done[-1][0] == 0x100 and all(r == 2 for _, r in rm.done[-1][1])

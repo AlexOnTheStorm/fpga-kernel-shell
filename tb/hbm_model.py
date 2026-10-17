@@ -11,6 +11,8 @@
 # - случайные паузы ARREADY/AWREADY/WREADY с вероятностью p_stall;
 # - slverr: адреса начала burst'ов, на которые RRESP/BRESP = 2 (запись не выполняется);
 # - freeze(): перестать отвечать (уже выставленный beat/B держится до handshake);
+# - hold: адреса начала burst'ов, чей ответ (R/B) задерживается до release(addr) —
+#   точная по времени подача ответа (например, SLVERR в выбранный такт);
 # - проверки протокола (AssertionError → тест падает): AxLEN = 7, AxSIZE = 5,
 #   AxBURST = INCR, адрес кратен 32, burst не пересекает 4 KB, WLAST ровно на beat'е AxLEN.
 #
@@ -40,11 +42,13 @@ class _Burst:
 
 class HbmModel:
     def __init__(self, dut, prefix="m_axi", n_pc=8, lat=(20, 60), seed=0,
-                 p_stall=0.2, interleave=False, slverr=None, has_read=True, has_write=True):
+                 p_stall=0.2, interleave=False, slverr=None, hold=None, has_read=True,
+                 has_write=True):
         self.dut = dut
         self.n_pc, self.lat, self.p_stall, self.interleave = n_pc, lat, p_stall, interleave
         self.rng = random.Random(seed)
         self.slverr = set(slverr or ())
+        self.hold = set(hold or ())
         self.has_read, self.has_write = has_read, has_write
         self.frozen = False
         self.cycle = 0
@@ -121,6 +125,10 @@ class HbmModel:
         """Перестать отвечать: READY низкие, новых R/B нет (для watchdog)."""
         self.frozen = True
 
+    def release(self, addr):
+        """Отпустить задержанный burst: его ответ выйдет на ближайшем такте (если готов)."""
+        self.hold.discard(addr)
+
     def start(self):
         """Запустить корутину каналов (AR/R и/или AW/W/B)."""
         if self._task is None:
@@ -195,7 +203,7 @@ class HbmModel:
         heads = {}
         for b in pending:
             heads.setdefault(b.id, b)
-        ready = [b for b in heads.values() if b.ready <= self.cycle]
+        ready = [b for b in heads.values() if b.ready <= self.cycle and b.addr not in self.hold]
         if not ready:
             return None
         return min(ready, key=lambda b: (b.ready, b.seq))
@@ -207,7 +215,7 @@ class HbmModel:
         heads = {}
         for b in self._rd:
             heads.setdefault(b.id, b)
-        ready = [b for b in heads.values() if b.ready <= self.cycle]
+        ready = [b for b in heads.values() if b.ready <= self.cycle and b.addr not in self.hold]
         return self.rng.choice(ready) if ready else None
 
     def _sample(self):

@@ -1,7 +1,8 @@
 # Системные тесты kshell (docs/design.md §16): хост — AxilMaster + shell.py, память — HbmModel
 # (OoO по ID). Тест выбирается по имени верхнего уровня (kshell_sink_top / kshell_top).
 #   T1 memcpy LOAD → WAIT → STORE; T2 STREAM в sink_kernel (порядок при OoO, tlast, skid);
-#   T7 ошибки декодирования + переполнение командной FIFO.
+#   T7 ошибки декодирования + переполнение командной FIFO;
+#   T3 GEMV, T4 перекрытие; T5 SLVERR в полёте, T6 пауза/продолжение, T8 watchdog (kshell_top).
 # Дополнительно к брифу (Task 6): IDLE/perf/SOFT_RESET после программы, порядок AW/W в
 # AXI-Lite, KERNEL_ERR от sink_kernel, watchdog, приоритет ошибок в одном такте нет (§12.2
 # покрыт kshell_sva). Сборка: -GWDOG_CYCLES=2000 (R5), все module SVA через SVA_EXTRA (R4).
@@ -364,6 +365,8 @@ async def t4_overlap(dut):
     mem.write_bytes(0x2100000, x1.tobytes())
     res = {}
     for name, fn in (("seq", sequential), ("ovl", overlapped)):
+        for a in (0x3000000, 0x3100000):                    # R15b: старый y не «пройдёт» проверку
+            mem.write_bytes(a, b"\xAA" * (4 * M))
         p = fn(M, K); check_program(p)
         await shell.submit(ax, p); await shell.wait_sem(ax, 7, 1)
         res[name] = await shell.perf(ax)
@@ -373,3 +376,188 @@ async def t4_overlap(dut):
     assert res["ovl"]["CYCLES"] < res["seq"]["CYCLES"]
     assert res["ovl"]["KRN_BUSY"] / res["ovl"]["CYCLES"] > res["seq"]["KRN_BUSY"] / res["seq"]["CYCLES"]
     dut._log.info("seq=%s ovl=%s", res["seq"], res["ovl"])
+
+
+# --------------------------------------------------------------------------- T5, T6, T8 (бриф, часть 3)
+
+def gemv_prog(M, K):
+    """#0 LOAD x, #1 STREAM W, #2 WAIT, #3 RUN, #4 WAIT, #5 STORE y, #6 WAIT, #7 SIGNAL."""
+    p = Program(); p.load(0, 0, 0x2000000, K); p.stream(0x1000000, M * K); p.wait(0, 1)
+    p.run(1, 0, 64, M, K); p.wait(1, 1); p.store(2, 64, 0x3000000, 4 * M); p.wait(2, 1); p.signal(7, 1)
+    return p
+
+@cocotb.test(skip=TOP != "kshell_top")
+async def t5_slverr_in_flight(dut):
+    """SLVERR на LOAD x (#0), на burst'е 20 STREAM W (#1, ядро в середине RUN) и на STORE y (#5):
+    код и номер команды (§12.2), семафоры не растут, AXI_QUIET без SOFT_RESET (ничего не
+    бросается), SOFT_RESET сбрасывает и зависшее ядро (k_rst_n); затем та же программа верна."""
+    exp_cmd = dict(load=0, stream=1, store=5)
+    exp_sem = dict(load=(0, 0), stream=(1, 0), store=(1, 1))          # (sem0, sem1)
+    for target in ("load", "stream", "store"):
+        ax, mem = await bringup(dut, lat=(10, 80), seed=5,
+                                slverr={dict(load=0x2000000, stream=0x1000000 + 256 * 20,
+                                             store=0x3000000)[target]})
+        rng = np.random.default_rng(5); M, K = 64, 512
+        W, x, y = gemv_case(rng, M, K)
+        mem.write_bytes(0x1000000, W.tobytes()); mem.write_bytes(0x2000000, x.tobytes())
+        p = gemv_prog(M, K); check_program(p)
+        await shell.submit(ax, p)
+        for _ in range(20000):
+            await RisingEdge(dut.clk)
+            if (st := await shell.status(ax))["ERROR"]: break
+        assert st["ERROR"], f"{target}: нет ERROR"
+        assert await ax.read(shell.REG["ERR_CODE"]) == (2 if target == "store" else 1)
+        assert await ax.read(shell.REG["ERR_CMD"]) == exp_cmd[target], target      # R15a
+        assert await ax.read(shell.REG["SEM"] + 4 * 7) == 0           # программа не «прошла»
+        # сверх брифа: выданное доводится до конца само (ENABLE = 1, без SOFT_RESET)
+        for _ in range(2000 // 16):
+            if (st := await shell.status(ax))["AXI_QUIET"]: break
+            for _ in range(16): await RisingEdge(dut.clk)
+        assert st["AXI_QUIET"] and st["cq_free"] == 16, (target, st)
+        # ядро: на STREAM застряло в середине RUN (данные ROB отброшены, §12.2.4) — не IDLE
+        stuck = target == "stream"
+        assert bool(st["krn_busy"]) == stuck and bool(st["IDLE"]) == (not stuck), (target, st)
+        assert (await sem(ax, 0), await sem(ax, 1), await sem(ax, 2)) == exp_sem[target] + (0,), target
+        await shell.soft_reset(ax)                                     # ждёт AXI_QUIET
+        st = await shell.status(ax); assert st["IDLE"] and not st["ERROR"]
+        assert not st["krn_busy"] and await ax.read(shell.REG["ERR_CODE"]) == 0, (target, st)
+        # восстановление: та же программа без SLVERR проходит (ядро сброшено k_rst_n)
+        mem.slverr.clear(); mem.write_bytes(0x3000000, b"\xAA" * (4 * M))
+        await ax.write(shell.REG["CTRL"], 1)
+        await shell.submit(ax, p); await shell.wait_sem(ax, 7, 1)
+        assert (np.frombuffer(mem.read_bytes(0x3000000, 4 * M), np.int32) == y).all(), target
+        mem.stop(); await shell.reset(dut)                             # следующий цикл с новой моделью
+
+@cocotb.test(skip=TOP != "kshell_top")
+async def t6_pause_resume(dut):
+    ax, mem = await bringup(dut, lat=(10, 80), seed=6)
+    rng = np.random.default_rng(6); M, K = 64, 512
+    W, x0, y0 = gemv_case(rng, M, K); _, x1, _ = gemv_case(rng, M, K)
+    y1 = (W.astype(np.int64) @ x1.astype(np.int64)).astype(np.int32)
+    for a, d in ((0x1000000, W), (0x2000000, x0), (0x2100000, x1)): mem.write_bytes(a, d.tobytes())
+    p = overlapped(M, K); check_program(p)
+    await shell.submit(ax, p)
+    for _ in range(300): await RisingEdge(dut.clk)
+    st0 = await shell.status(ax)
+    assert not st0["IDLE"] and await sem(ax, 7) == 0, st0              # пауза посреди работы
+    await ax.write(shell.REG["CTRL"], 0)                               # пауза
+    for _ in range(5000):
+        await RisingEdge(dut.clk)
+        if (await shell.status(ax))["AXI_QUIET"]: break
+    assert (await shell.status(ax))["AXI_QUIET"]
+    # сверх брифа (§12.3, §12.5, §14): тишина держится, новых AR/AW нет, watchdog на паузе
+    # молчит (пауза > WDOG_CYCLES = 2000), perf не считает
+    ar, aw = mem.stats["ar"], mem.stats["aw"]
+    assert ar < 2 * (K // 256) + 2 * (M * K // 256), mem.stats       # работа реально не вся
+    pf0 = await shell.perf(ax)
+    for _ in range(3000): await RisingEdge(dut.clk)
+    st = await shell.status(ax)
+    assert st["AXI_QUIET"] and not st["ERROR"] and not st["IDLE"], st
+    assert (mem.stats["ar"], mem.stats["aw"]) == (ar, aw), mem.stats
+    pf1 = await shell.perf(ax)
+    assert pf1["CYCLES"] == pf0["CYCLES"] and pf1["RD_BURSTS"] == pf0["RD_BURSTS"], (pf0, pf1)
+    assert await sem(ax, 7) == 0
+    await ax.write(shell.REG["CTRL"], 1)                               # продолжение
+    await shell.wait_sem(ax, 7, 1)
+    assert (np.frombuffer(mem.read_bytes(0x3000000, 4 * M), np.int32) == y0).all()
+    assert (np.frombuffer(mem.read_bytes(0x3100000, 4 * M), np.int32) == y1).all()
+    st = await settle(dut, ax)
+    assert not st["ERROR"], st
+    assert mem.stats["ar"] == 2 * (K // 256) + 2 * (M * K // 256), mem.stats   # ни один burst не повторён
+
+@cocotb.test(skip=TOP != "kshell_top")
+async def t8_watchdog(dut):
+    # сборка с -GWDOG_CYCLES=2000 (см. команду ниже)
+    ax, mem = await bringup(dut, lat=(10, 40), seed=8)
+    p = Program(); p.wait(3, 1)                                        # долгий WAIT — не неисправность
+    await shell.submit(ax, p)
+    for _ in range(5000): await RisingEdge(dut.clk)
+    assert not (await shell.status(ax))["ERROR"]
+    await ax.write(shell.REG["SEM"] + 4 * 3, 1)
+    mem.write_bytes(0x2000000, bytes(256 * 8))
+    p = Program(); p.load(0, 0, 0x2000000, 256 * 8); await shell.submit(ax, p)
+    for _ in range(30): await RisingEdge(dut.clk)
+    mem.freeze()
+    st = await shell.status(ax)
+    assert st["rd_inflight"] > 0 and not st["AXI_QUIET"], st          # замёрзло с AR в полёте
+    for _ in range(5000): await RisingEdge(dut.clk)
+    assert await ax.read(shell.REG["ERR_CODE"]) == 7
+    assert await ax.read(shell.REG["ERR_CMD"]) == 1                   # последняя взятая (LOAD, #1)
+    assert await sem(ax, 0) == 0
+    # сверх брифа: после разморозки — тишина, SOFT_RESET, работа снова идёт
+    mem.frozen = False
+    await shell.soft_reset(ax)
+    st = await shell.status(ax)
+    assert st["IDLE"] and not st["ERROR"], st
+    # медленное ядро — не неисправность (§12.5): RUN без своей STREAM ждёт поток > WDOG_CYCLES
+    # при AXI_QUIET; STREAM подаётся позже (сознательно нарушает правило 6.1.1 — без check_program)
+    await ax.write(shell.REG["CTRL"], 1)
+    rng = np.random.default_rng(8); M, K = 64, 256
+    W, x, y = gemv_case(rng, M, K)
+    mem.write_bytes(0x1000000, W.tobytes()); mem.write_bytes(0x2000000, x.tobytes())
+    p = Program(); p.load(0, 0, 0x2000000, K); p.wait(0, 1); p.run(1, 0, 64, M, K)
+    await shell.submit(ax, p)
+    for _ in range(5000): await RisingEdge(dut.clk)
+    st = await shell.status(ax)
+    assert st["krn_busy"] and st["AXI_QUIET"] and not st["ERROR"] and not st["IDLE"], st
+    p = Program(); p.stream(0x1000000, M * K); p.wait(1, 1); p.store(2, 64, 0x3000000, 4 * M)
+    p.wait(2, 1); p.signal(7, 1)
+    await shell.submit(ax, p); await shell.wait_sem(ax, 7, 1)
+    assert (np.frombuffer(mem.read_bytes(0x3000000, 4 * M), np.int32) == y).all()
+    assert await ax.read(shell.REG["ERR_CODE"]) == 0
+
+
+@cocotb.test(skip=TOP != "kshell_top")
+async def t_kdone_after_error(dut):
+    """R10/R15c: k_done, пришедший ПОСЛЕ ошибки, не увеличивает семафор RUN (§7, §11, §12.2.3).
+    Ядро уже приняло весь свой поток (tlast), до k_done gemv ещё ~6 тактов; в этот промежуток
+    подаётся SLVERR несвязанного LOAD (#4): модель держит его ответ (hold) и отпускает в такте
+    handshake'а tlast. Тест проверяет своё предусловие: ошибка — строго после tlast и не позже k_done."""
+    poison = 0x2200000
+    ax, mem = await bringup(dut, lat=(10, 80), seed=9, slverr={poison}, hold={poison})
+    rng = np.random.default_rng(9); M, K = 64, 256
+    W, x, _ = gemv_case(rng, M, K)
+    mem.write_bytes(0x1000000, W.tobytes()); mem.write_bytes(0x2000000, x.tobytes())
+    ev = dict(last=[], err=[], done=[])
+    u = dut.u_shell
+
+    async def mon():
+        cyc = 0
+        while True:
+            await ReadOnly()
+            if int(dut.k_s_tvalid.value) and int(dut.k_s_tready.value) and int(dut.k_s_tlast.value):
+                ev["last"].append(cyc); mem.release(poison)
+            if int(u.rd_err_v.value) or int(u.wr_err_v.value) or int(u.dec_err_v.value) \
+                    or int(u.k_err_q.value) or int(u.wdog_hit_q.value):
+                ev["err"].append(cyc)
+            if int(dut.k_done.value):
+                ev["done"].append((cyc, int(u.error_q.value), int(u.krn_busy_q.value)))
+            await RisingEdge(dut.clk); cyc += 1
+    cocotb.start_soon(mon())
+    p = Program()
+    p.load(0, 0, 0x2000000, K)              # #0
+    p.stream(0x1000000, M * K)              # #1
+    p.wait(0, 1)                            # #2
+    p.run(1, 0, 64, M, K)                   # #3
+    p.load(4, 200, poison, 256)             # #4 SLVERR, ответ задержан до tlast
+    p.wait(1, 1)                            # #5
+    p.signal(7, 1)                          # #6
+    check_program(p)
+    await shell.submit(ax, p)
+    for _ in range(20000 // 16):
+        if ev["done"]: break
+        for _ in range(16): await RisingEdge(dut.clk)
+    for _ in range(20): await RisingEdge(dut.clk)
+    dut._log.info("tlast/err/k_done: %s", ev)
+    assert len(ev["last"]) == 1 and len(ev["done"]) == 1, ev
+    t_last, (t_done, _, busy) = ev["last"][0], ev["done"][0]
+    assert ev["err"] and t_last < ev["err"][0] <= t_done and busy, ev   # предусловие теста
+    assert await ax.read(shell.REG["ERR_CODE"]) == 1
+    assert await ax.read(shell.REG["ERR_CMD"]) == 4
+    assert await sem(ax, 1) == 0, "k_done после ошибки увеличил семафор RUN"
+    assert await sem(ax, 0) == 1 and await sem(ax, 4) == 0 and await sem(ax, 7) == 0
+    st = await shell.status(ax)
+    assert st["ERROR"] and not st["krn_busy"], st                     # k_done снял krn_busy
+    await shell.soft_reset(ax)
+    st = await shell.status(ax)
+    assert st["IDLE"] and not st["ERROR"], st
