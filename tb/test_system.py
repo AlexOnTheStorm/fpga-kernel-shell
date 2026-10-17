@@ -314,3 +314,62 @@ async def t_axil_regs(dut):
     assert await ax.read(sem_a(3)) == 0                         # SOFT_RESET (AXI тихо) → sem = 0
     st = await shell.status(ax)
     assert st["IDLE"] and st["AXI_QUIET"] and st["cq_free"] == 16, st
+
+
+# --------------------------------------------------------------------------- T3, T4 (бриф, часть 2)
+
+def gemv_case(rng, M, K):
+    W = rng.integers(-128, 128, (M, K), dtype=np.int8)
+    x = rng.integers(-128, 128, K, dtype=np.int8)
+    return W, x, (W.astype(np.int64) @ x.astype(np.int64)).astype(np.int32)
+
+@cocotb.test(skip=TOP != "kshell_top")
+async def t3_gemv(dut):
+    ax, mem = await bringup(dut, lat=(10, 120), seed=3)
+    rng = np.random.default_rng(3)
+    for M, K in ((64, 256), (128, 512)):
+        W, x, y = gemv_case(rng, M, K)
+        mem.write_bytes(0x1000000, W.tobytes()); mem.write_bytes(0x2000000, x.tobytes())
+        p = Program(); p.load(0, 0, 0x2000000, K); p.stream(0x1000000, M * K); p.wait(0, 1)
+        p.run(1, 0, 64, M, K); p.wait(1, 1); p.store(2, 64, 0x3000000, 4 * M); p.wait(2, 1)
+        p.signal(7, 1); check_program(p)
+        await shell.submit(ax, p); await shell.wait_sem(ax, 7, 1)
+        got = np.frombuffer(mem.read_bytes(0x3000000, 4 * M), np.int32)
+        assert (got == y).all(), f"M={M} K={K}"
+        await shell.soft_reset(ax); await ax.write(shell.REG["CTRL"], 1)
+
+def overlapped(M, K):           # §6.2
+    p = Program()
+    p.load(0, 0, 0x2000000, K); p.stream(0x1000000, M * K); p.wait(0, 1); p.run(1, 0, 64, M, K)
+    p.load(0, 16, 0x2100000, K); p.stream(0x1000000, M * K); p.wait(0, 2); p.run(1, 16, 72, M, K)
+    p.wait(1, 1); p.store(2, 64, 0x3000000, 4 * M)
+    p.wait(1, 2); p.store(2, 72, 0x3100000, 4 * M); p.wait(2, 2); p.signal(7, 1)
+    return p
+
+def sequential(M, K):           # базовая линия: WAIT после каждой команды
+    p = Program()
+    p.load(0, 0, 0x2000000, K); p.wait(0, 1); p.stream(0x1000000, M * K); p.run(1, 0, 64, M, K); p.wait(1, 1)
+    p.load(0, 16, 0x2100000, K); p.wait(0, 2); p.stream(0x1000000, M * K); p.run(1, 16, 72, M, K); p.wait(1, 2)
+    p.store(2, 64, 0x3000000, 4 * M); p.wait(2, 1); p.store(2, 72, 0x3100000, 4 * M); p.wait(2, 2)
+    p.signal(7, 1)
+    return p
+
+@cocotb.test(skip=TOP != "kshell_top")
+async def t4_overlap(dut):
+    ax, mem = await bringup(dut, lat=(40, 160), seed=4)
+    rng = np.random.default_rng(4); M, K = 64, 512
+    W, x0, y0 = gemv_case(rng, M, K); _, x1, _ = gemv_case(rng, M, K)
+    y1 = (W.astype(np.int64) @ x1.astype(np.int64)).astype(np.int32)
+    mem.write_bytes(0x1000000, W.tobytes()); mem.write_bytes(0x2000000, x0.tobytes())
+    mem.write_bytes(0x2100000, x1.tobytes())
+    res = {}
+    for name, fn in (("seq", sequential), ("ovl", overlapped)):
+        p = fn(M, K); check_program(p)
+        await shell.submit(ax, p); await shell.wait_sem(ax, 7, 1)
+        res[name] = await shell.perf(ax)
+        assert (np.frombuffer(mem.read_bytes(0x3000000, 4 * M), np.int32) == y0).all()
+        assert (np.frombuffer(mem.read_bytes(0x3100000, 4 * M), np.int32) == y1).all()
+        await shell.soft_reset(ax); await ax.write(shell.REG["CTRL"], 1)
+    assert res["ovl"]["CYCLES"] < res["seq"]["CYCLES"]
+    assert res["ovl"]["KRN_BUSY"] / res["ovl"]["CYCLES"] > res["seq"]["KRN_BUSY"] / res["seq"]["CYCLES"]
+    dut._log.info("seq=%s ovl=%s", res["seq"], res["ovl"])
