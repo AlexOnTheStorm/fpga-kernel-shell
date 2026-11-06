@@ -7,8 +7,12 @@
 //
 //  Описано по шаблону вендора «true dual-port RAM с побайтовой записью»
 //  (Xilinx UG901, режим NO_CHANGE), чтобы синтез положил массив в BRAM:
-//  один адрес на порт, один always_ff на порт, у каждого порта — en/we/
+//  один адрес на порт, один процесс на порт, у каждого порта — en/we/
 //  маска байтов/регистр чтения. Порт A пишет полной маской.
+//  Процессы портов — `always @(posedge clk)`, а не `always_ff`: mem_q
+//  пишут оба порта, а переменную, которую пишет always_ff, не может
+//  писать никакой другой процесс (IEEE 1800-2017 §9.2.2.4; slang это
+//  ловит, Verilator молчит). Так же записан и шаблон UG901.
 //  NO_CHANGE: регистр чтения обновляется только чтением (en && !we),
 //  запись его не трогает. Поэтому a_rd_data держится после gnt до
 //  следующего ЧТЕНИЯ порта A, даже если в следующем такте rd_dma пишет
@@ -54,7 +58,7 @@ module spm (
   assign a_addr   = a_wr_v ? a_wr_addr : a_rd_addr;
 
   // порт A (we = a_wr_v, маска — все байты)
-  always_ff @(posedge clk) begin
+  always @(posedge clk) begin
     if (a_en) begin
       if (a_wr_v) begin
         for (int i = 0; i < BB; i++) mem_q[a_addr][8*i+:8] <= a_wr_data[8*i+:8];
@@ -65,7 +69,7 @@ module spm (
   end
 
   // порт B (we = b_we, маска b_wstrb)
-  always_ff @(posedge clk) begin
+  always @(posedge clk) begin
     if (b_en) begin
       if (b_we) begin
         for (int i = 0; i < BB; i++) begin

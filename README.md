@@ -44,7 +44,7 @@ Spec (Russian): [`docs/design.md`](docs/design.md). RTL style: [`docs/style_note
 | `cmd_seq` | decode and check commands, dispatch to engine queues in order, WAIT, stop on error |
 | `rd_dma` | LOAD and STREAM: burst slicing, AR with `ARID` = window slot, in-order commit, ROB |
 | `wr_dma` | STORE: scratchpad to W-FIFO first, then AW/W, count B responses |
-| `spm` | true dual-port scratchpad written as the vendor BRAM template (one address and one `always_ff` per port): A = DMA, full-word writes; B = kernel, byte write strobes |
+| `spm` | true dual-port scratchpad written as the vendor BRAM template (one address and one process per port; plain `always`, because both ports write the same array, which `always_ff` forbids): A = DMA, full-word writes; B = kernel, byte write strobes |
 | `sem_file` | semaphore counters, same-cycle increments are summed |
 | `kshell_perf` | 8 perf counters with an atomic snapshot |
 | `kshell_kif_sva` | the kernel contract as bindable assertions |
